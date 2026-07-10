@@ -1,50 +1,44 @@
-"""Diagnose ESOM: test different penalty values."""
-import os, sys, numpy as np
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from solvers.baselines.esom import esom
-from problems.obj_factory import obj_factory
-from problems.init_policy import init_policy
-from utils.helper.graph import generate_random_graph
+"""Optional ESOM sensitivity diagnostic with executable assertions."""
 
-P = {"Nagent": 10, "p_edge": 0.5, "d_override": 10, "info": 2, "NC": 3}
-param_bank, M_alpha_policy, x0_gen = init_policy("regular")
+from __future__ import annotations
 
-for obj_name in ["ridge", "logsumexp"]:
-    args = param_bank.get(obj_name, [P["d_override"]])
-    args = [P["d_override"]] + list(args[1:])
-    fun_list, d, L_vec, x_opt_list, f_opt_list, is_convex, fname, fparam = \
-        obj_factory(obj_name, P["Nagent"], *args)
+import sys
+from pathlib import Path
 
-    np.random.seed(100)
-    _, W = generate_random_graph(P["Nagent"], P["p_edge"])
-    x0_fn = x0_gen.get(obj_name, lambda d, far: np.random.randn(d))
-    x0 = x0_fn(d, False)
-    policy = M_alpha_policy[obj_name]
-    M_val = policy["M_factor"] * float(L_vec.max())
-    alp_val = policy["alpha"] / float(L_vec.max())
+import numpy as np
+import pytest
 
-    print(f"\n{'='*60}\n  ESOM on {obj_name}  (M_val={M_val:.2f}, L_max={float(L_vec.max()):.1f})")
-    print(f"{'='*60}")
+_CODES_ROOT = Path(__file__).resolve().parents[1]
+if str(_CODES_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CODES_ROOT))
 
-    for penalty in [0.5, 1.0, 5.0, M_val]:
-        for unit_reg in [0.0, 1.0]:
-            prm = dict(Nagent=P["Nagent"], dim=d, f=fun_list, W=W,
-                       x_opt=x_opt_list[0], f_opt=float(np.mean(f_opt_list)),
-                       fname=fname, fparam=fparam, info=2, NC=P["NC"],
-                       alpha=alp_val, M=M_val, decay_alpha=False,
-                       esom_penalty=penalty, esom_unit_reg=unit_reg,
-                       maxIt=500, tol=1e-12, tolType="combo",
-                       verbose=False, countComm=True)
-            try:
-                _, out = esom(x0.copy(), prm)
-                c = np.asarray(out["combo"]); c = c[np.isfinite(c)]
-                rf = np.asarray(out["relF"]); rf = rf[np.isfinite(rf)]
-                fc = float(c[-1]) if len(c) else float('nan')
-                fr = float(rf[-1]) if len(rf) else float('nan')
-                steps = len(c)
-                tag = 'OK' if fc < 1e-8 else ('DIVG' if fc > 10 else 'partial')
-                print(f"  penalty={penalty:5.1f}  unit_reg={unit_reg:.1f}  "
-                      f"steps={steps:4d}  combo={fc:.2e}  relF={fr:.2e}  [{tag}]")
-            except Exception as e:
-                print(f"  penalty={penalty:5.1f}  unit_reg={unit_reg:.1f}  CRASH: {e}")
-print("\nDone.")
+from experiments.benchmarks.run_regular import _worker_mc_regular
+
+
+@pytest.mark.slow
+def test_esom_produces_a_finite_trace_on_paper_ridge_case() -> None:
+    protocol = {
+        "Nagent": 10,
+        "p_edge": 0.5,
+        "maxIt": 50,
+        "tol": 1e-12,
+        "tolType": "combo",
+        "verbose": False,
+        "showPlots": False,
+        "far": False,
+        "useWorst": False,
+        "nStart": 1,
+        "d_override": 10,
+        "info": 2,
+        "NC": 3,
+        "NC_schedule": "log",
+        "log_p": 3.0,
+        "log_c_mix": 2.0,
+        "NC_max": 10,
+        "countComm": True,
+    }
+    _, logs, _ = _worker_mc_regular(("ridge", 0, protocol))
+    trace = np.asarray(logs["ESOM"].get("ValueF", []), dtype=float)
+
+    assert trace.size > 0
+    assert np.all(np.isfinite(trace))

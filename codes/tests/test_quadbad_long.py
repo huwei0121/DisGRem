@@ -1,49 +1,44 @@
-"""Quick test: can DisGrem converge on quadbad with more iterations?"""
-import numpy as np, sys, os
-_root = os.getcwd()
-sys.path.insert(0, _root)
-from utils.alg.alg_bank import get_alg_bank
-from problems.obj_factory import obj_factory
-from problems.init_policy import init_policy
-from utils.helper.graph import generate_random_graph
+"""Optional long-run regression for the ill-conditioned quadratic case."""
 
-N, d = 10, 10
-np.random.seed(42)
-_, W = generate_random_graph(N, 0.5)
-fun_list, d_out, L_vec, x_opt_list, f_opt_list, is_convex, fname, fparam = \
-    obj_factory('quadbad', N, d)
+from __future__ import annotations
 
-param_bank, M_alpha_policy, x0_generator = init_policy("regular")
-policy = M_alpha_policy.get("quadbad", {"M_factor": 1.0, "alpha": 0.1, "decay": False, "maxIt": 2000})
-M_val   = policy["M_factor"] * float(L_vec.max())
-alp_val = policy["alpha"] / float(L_vec.max())
+import sys
+from pathlib import Path
 
-np.random.seed(100)
-x0_gen = x0_generator.get("quadbad", lambda d, far: np.random.randn(d))
-np.random.seed(100)
-x0 = x0_gen(d, False)  # shape (d,) - algorithm tiles internally
+import numpy as np
+import pytest
 
-prm = {
-    "W": W, "maxIt": 10000, "tol": 1e-8, "tolType": "relF",
-    "NC": 3, "verbose": False, "M": M_val, "alpha": alp_val,
-    "decay_alpha": policy["decay"], "f_opt": float(np.mean(f_opt_list)),
-    "x_opt": x_opt_list[0] if x_opt_list else None,
-    "esom_penalty": 1.0, "Nagent": N, "dim": d_out,
-    "f": None,  # set below
-}
+_CODES_ROOT = Path(__file__).resolve().parents[1]
+if str(_CODES_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CODES_ROOT))
 
-ab = {name: func for name, func in get_alg_bank("All")}
-prm["f"] = fun_list
-for alg_name in ["DisGrem", "CeDisGrem", "DQM"]:
-    _, out = ab[alg_name](x0.copy(), dict(prm))
-    combo_vals = np.array(out.get('combo', [1]))
-    relF_vals  = np.array(out.get('relF', [1]))
-    relX_vals  = np.array(out.get('relX', [1]))
-    n_steps = len(combo_vals)
-    print(f"\n[{alg_name}] ran {n_steps} logged steps:")
-    print(f"  Final combo={combo_vals[-1]:.4e}  relF={relF_vals[-1]:.4e}  relX={relX_vals[-1]:.4e}")
-    print(f"  Min combo={np.nanmin(combo_vals):.4e}")
-    for frac in [0.2, 0.5, 0.8, 1.0]:
-        idx = int(n_steps*frac) - 1
-        if 0 <= idx < n_steps:
-            print(f"  At {int(frac*100)}% ({idx+1} steps): combo={combo_vals[idx]:.4e}")
+from experiments.benchmarks.run_regular import _worker_mc_regular
+
+
+@pytest.mark.slow
+def test_quadbad_disgrem_trace_remains_finite() -> None:
+    protocol = {
+        "Nagent": 10,
+        "p_edge": 0.5,
+        "maxIt": 1500,
+        "tol": 1e-8,
+        "tolType": "relF",
+        "verbose": False,
+        "showPlots": False,
+        "far": False,
+        "useWorst": False,
+        "nStart": 1,
+        "d_override": 10,
+        "info": 2,
+        "NC": 3,
+        "NC_schedule": "log",
+        "log_p": 3.0,
+        "log_c_mix": 2.0,
+        "NC_max": 10,
+        "countComm": True,
+    }
+    _, logs, _ = _worker_mc_regular(("quadbad", 0, protocol))
+    trace = np.asarray(logs["DisGrem"].get("ValueF", []), dtype=float)
+
+    assert trace.size > 0
+    assert np.all(np.isfinite(trace))

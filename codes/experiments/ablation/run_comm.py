@@ -16,7 +16,6 @@ import os
 import sys
 import csv
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _root not in sys.path:
@@ -28,6 +27,13 @@ from problems.init_policy import init_policy
 from utils.helper.graph import generate_random_graph
 from utils.helper.run_utils import detect_diverged
 from utils.export.plot_utils import fig_ce_benefit, fig_comm_ablation
+from experiments.protocol import (
+    configured_iteration_override,
+    execute_cached_tasks,
+    nanmean_columns,
+    resolve_iteration_budget,
+    write_json_gz,
+)
 
 
 #  Constants
@@ -73,7 +79,7 @@ def _set_blas_single():
 def _build_prm(P, policy, fun_list, d, L_vec,
                x_opt_list, f_opt_list, fname, fparam, W):
     prm = dict(P)
-    prm["maxIt"] = policy.get("maxIt", P["maxIt"])
+    prm["maxIt"] = resolve_iteration_budget(policy, P)
     prm["verbose"] = False
     if "tolType" in policy:
         prm["tolType"] = policy["tolType"]
@@ -105,7 +111,7 @@ def _comm_at_tol(out, tol_levels):
 
 
 def _run_one_alg(obj_name, alg_name, mc_idx, P_base, prm_overrides=None):
-    """Run a single (obj, alg, mc) combination. Returns (relF, commCost) arrays."""
+    """Run one configuration and retain failed traces instead of dropping them."""
     _set_blas_single()
 
     param_bank, M_alpha_policy, x0_generator = init_policy("regular")
@@ -116,7 +122,7 @@ def _run_one_alg(obj_name, alg_name, mc_idx, P_base, prm_overrides=None):
             alg_func = f
             break
     if alg_func is None:
-        return None
+        raise ValueError(f"unknown algorithm: {alg_name}")
 
     obj_args = param_bank.get(obj_name, [_DIM])
     if obj_args and isinstance(obj_args[0], (int, float)):
@@ -141,17 +147,23 @@ def _run_one_alg(obj_name, alg_name, mc_idx, P_base, prm_overrides=None):
         prm.update(prm_overrides)
 
     f0_val = float(np.mean([fi(x0) for fi in fun_list]))
+    error = None
     try:
         _, out = alg_func(x0.copy(), dict(prm))
-        if detect_diverged(out, f0_val):
-            return None
-    except Exception:
-        return None
+    except Exception as exc:
+        out = {"fail": True, "failReason": str(exc)}
+        error = {"type": type(exc).__name__, "message": str(exc)}
 
-    if out.get("fail"):
-        return None
+    diverged = detect_diverged(out, f0_val)
+    failed = bool(out.get("fail") or diverged)
+    failure_reason = out.get("failReason")
+    if diverged and not failure_reason:
+        failure_reason = "detect_diverged"
 
     return {
+        "failed": failed,
+        "failure_reason": failure_reason,
+        "exception": error,
         "relF": np.asarray(out.get("relF", []), dtype=float),
         "commCost": np.asarray(out.get("commCost", []), dtype=float),
     }
@@ -160,13 +172,23 @@ def _run_one_alg(obj_name, alg_name, mc_idx, P_base, prm_overrides=None):
 #  Part 1 workers and runner
 
 def _worker_part1(args):
-    """Worker for Part 1: returns (obj_name, alg_name, mc_idx, comm_vals)."""
+    """Worker for Part 1 with explicit failure metadata."""
     obj_name, alg_name, mc_idx, P_base = args
     result = _run_one_alg(obj_name, alg_name, mc_idx, P_base)
-    if result is None:
-        return (obj_name, alg_name, mc_idx, [np.nan] * len(_TOL_LEVELS))
-    return (obj_name, alg_name, mc_idx,
-            _comm_at_tol(result, _TOL_LEVELS))
+    comm_values = (
+        [np.nan] * len(_TOL_LEVELS)
+        if result["failed"]
+        else _comm_at_tol(result, _TOL_LEVELS)
+    )
+    return (
+        obj_name,
+        alg_name,
+        mc_idx,
+        comm_values,
+        result["failed"],
+        result["failure_reason"],
+        result["exception"],
+    )
 
 
 def _run_part1(results_dir):
@@ -176,6 +198,7 @@ def _run_part1(results_dir):
 
     P_base = {
         "Nagent": 10, "p_edge": 0.5, "maxIt": int(os.environ.get("LOG_SCHEDULE_MAXIT", "500")),
+        "iteration_budget_override": configured_iteration_override(),
         "tol": 1e-12, "tolType": "combo",
         "verbose": False, "NC": 3, "NC_schedule": "log", "log_p": 3.0, "log_c_mix": 2.0, "NC_max": 10, "info": 2,
         "countComm": True,
@@ -194,18 +217,17 @@ def _run_part1(results_dir):
     print(f"  {len(tasks)} tasks on {_N_WORKERS} workers")
 
     raw = {}
-    done = 0
-    with ProcessPoolExecutor(max_workers=_N_WORKERS) as pool:
-        futs = {pool.submit(_worker_part1, t): t for t in tasks}
-        for fut in as_completed(futs):
-            done += 1
-            try:
-                obj_name, alg_name, _, comm_vals = fut.result()
-                raw.setdefault((obj_name, alg_name), []).append(comm_vals)
-            except Exception as exc:
-                print(f"    [warn] {exc}")
-            if done % 20 == 0:
-                print(f"    {done}/{len(tasks)} done")
+    completed = execute_cached_tasks(
+        tasks,
+        _worker_part1,
+        cache_root=os.path.join(_root, "_run_cache"),
+        namespace="comm_ce_benefit",
+        max_workers=_N_WORKERS,
+    )
+    for obj_name, alg_name, mc_idx, comm_vals, failed, reason, error in completed:
+        raw.setdefault((obj_name, alg_name), []).append(
+            (mc_idx, comm_vals, failed, reason, error)
+        )
 
     all_data = {}
     csv_rows = [["Function", "Algorithm"] +
@@ -214,9 +236,10 @@ def _run_part1(results_dir):
     for obj_name in _COMM_FUNCS:
         all_data[obj_name] = {}
         for alg_name in alg_names:
-            runs = raw.get((obj_name, alg_name), [])
+            indexed_runs = sorted(raw.get((obj_name, alg_name), []))
+            runs = [values for _, values, _, _, _ in indexed_runs]
             if runs:
-                comm_mean = np.nanmean(np.array(runs, dtype=float), axis=0)
+                comm_mean = nanmean_columns(runs)
             else:
                 comm_mean = np.full(len(_TOL_LEVELS), np.nan)
             all_data[obj_name][alg_name] = comm_mean.tolist()
@@ -229,19 +252,49 @@ def _run_part1(results_dir):
         csv.writer(fh).writerows(csv_rows)
     print(f"  [Saved] {csv_path}")
 
+    write_json_gz(
+        os.path.join(results_dir, "data_log", "raw_ce_benefit.json.gz"),
+        {
+            "schema_version": 1,
+            "mode": "comm",
+            "study": "ce_benefit",
+            "tolerances": _TOL_LEVELS,
+            "runs": [
+                {
+                    "objective": objective,
+                    "algorithm": algorithm,
+                    "mc_index": mc_index,
+                    "seed": 300 + mc_index,
+                    "communication_at_tolerance_mb": values,
+                    "failed": failed,
+                    "failure_reason": reason,
+                    "exception": error,
+                }
+                for (objective, algorithm), indexed in sorted(raw.items())
+                for mc_index, values, failed, reason, error in sorted(indexed)
+            ],
+        },
+    )
+
     fig_ce_benefit(all_data, _CE_PAIRS, _TOL_LEVELS, results_dir)
 
 
 #  Part 2 workers and runners
 
 def _worker_part2(args):
-    """Worker for Part 2: returns (obj_name, config_label, mc_idx, relF, commCost)."""
+    """Worker for Part 2 with trace and failure metadata."""
     obj_name, config_label, mc_idx, P_base, prm_overrides = args
     result = _run_one_alg(obj_name, "CeDisGrem", mc_idx, P_base, prm_overrides)
-    if result is None:
-        return (obj_name, config_label, mc_idx, None, None)
-    return (obj_name, config_label, mc_idx,
-            result["relF"].tolist(), result["commCost"].tolist())
+    return (
+        obj_name,
+        config_label,
+        mc_idx,
+        result["relF"].tolist(),
+        result["commCost"].tolist(),
+        result["failed"],
+        result["failure_reason"],
+        result["exception"],
+    )
 
 
 def _run_part2a(results_dir):
@@ -252,6 +305,7 @@ def _run_part2a(results_dir):
 
     P_base = {
         "Nagent": 10, "p_edge": 0.5, "maxIt": int(os.environ.get("LOG_SCHEDULE_MAXIT", "500")),
+        "iteration_budget_override": configured_iteration_override(),
         "tol": 1e-12, "tolType": "combo",
         "verbose": False, "NC": 3, "NC_schedule": "log", "log_p": 3.0, "log_c_mix": 2.0, "NC_max": 10, "info": 2,
         "countComm": True,
@@ -268,44 +322,68 @@ def _run_part2a(results_dir):
     print(f"  {len(tasks)} tasks on {_N_WORKERS} workers")
 
     raw = {}
-    done = 0
-    with ProcessPoolExecutor(max_workers=_N_WORKERS) as pool:
-        futs = {pool.submit(_worker_part2, t): t for t in tasks}
-        for fut in as_completed(futs):
-            done += 1
-            try:
-                obj_name, label, _, relF, commCost = fut.result()
-                if relF is not None:
-                    raw.setdefault((obj_name, label), []).append(
-                        (np.array(relF), np.array(commCost)))
-            except Exception as exc:
-                print(f"    [warn] {exc}")
-            if done % 20 == 0:
-                print(f"    {done}/{len(tasks)} done")
+    completed = execute_cached_tasks(
+        tasks,
+        _worker_part2,
+        cache_root=os.path.join(_root, "_run_cache"),
+        namespace="comm_klazy_sweep",
+        max_workers=_N_WORKERS,
+    )
+    for obj_name, label, mc_idx, relF, commCost, failed, reason, error in completed:
+        raw.setdefault((obj_name, label), []).append(
+            (mc_idx, np.array(relF), np.array(commCost), failed, reason, error)
+        )
 
     curves_by_func = {}
     klazy_labels = [f"Klazy={kl}" for kl in _KLAZY_VALUES]
     for obj_name in _COMM_FUNCS:
         curves = []
         for label in klazy_labels:
-            runs = raw.get((obj_name, label), [])
+            runs = [
+                run
+                for run in raw.get((obj_name, label), [])
+                if not run[3] and len(run[1]) > 0
+            ]
             if not runs:
                 curves.append((label, None, None))
                 continue
-            max_len = max(len(r) for r, _ in runs)
+            max_len = max(len(run[1]) for run in runs)
             relF_mat = np.full((_NSTART, max_len), np.nan)
             comm_mat = np.full((_NSTART, max_len), np.nan)
-            for si, (rF, cC) in enumerate(runs):
+            for si, (_, rF, cC, _, _, _) in enumerate(sorted(runs)):
                 relF_mat[si, :len(rF)] = rF
                 comm_mat[si, :len(cC)] = cC
             curves.append((label,
-                           np.nanmean(relF_mat, axis=0),
-                           np.nanmean(comm_mat, axis=0)))
+                           nanmean_columns(relF_mat),
+                           nanmean_columns(comm_mat)))
         curves_by_func[obj_name] = curves
 
     fig_comm_ablation(curves_by_func, _COMM_FUNCS,
                       "Klazy Sweep (CeDisGrem)", "klazy_sweep",
                       results_dir, cmap_name="Blues")
+    write_json_gz(
+        os.path.join(results_dir, "data_log", "raw_klazy_sweep.json.gz"),
+        {
+            "schema_version": 1,
+            "mode": "comm",
+            "study": "klazy_sweep",
+            "runs": [
+                {
+                    "objective": objective,
+                    "configuration": label,
+                    "mc_index": mc_index,
+                    "seed": 300 + mc_index,
+                    "relF": rel_f,
+                    "commCost": comm_cost,
+                    "failed": failed,
+                    "failure_reason": reason,
+                    "exception": error,
+                }
+                for (objective, label), indexed in sorted(raw.items())
+                for mc_index, rel_f, comm_cost, failed, reason, error in sorted(indexed)
+            ],
+        },
+    )
     print("  Part 2a done.")
 
 
@@ -317,6 +395,7 @@ def _run_part2b(results_dir):
 
     P_base = {
         "Nagent": 10, "p_edge": 0.5, "maxIt": int(os.environ.get("LOG_SCHEDULE_MAXIT", "500")),
+        "iteration_budget_override": configured_iteration_override(),
         "tol": 1e-12, "tolType": "combo",
         "verbose": False, "NC": 3, "NC_schedule": "log", "log_p": 3.0, "log_c_mix": 2.0, "NC_max": 10, "info": 2,
         "countComm": True,
@@ -338,44 +417,68 @@ def _run_part2b(results_dir):
     print(f"  {len(tasks)} tasks on {_N_WORKERS} workers")
 
     raw = {}
-    done = 0
-    with ProcessPoolExecutor(max_workers=_N_WORKERS) as pool:
-        futs = {pool.submit(_worker_part2, t): t for t in tasks}
-        for fut in as_completed(futs):
-            done += 1
-            try:
-                obj_name, label, _, relF, commCost = fut.result()
-                if relF is not None:
-                    raw.setdefault((obj_name, label), []).append(
-                        (np.array(relF), np.array(commCost)))
-            except Exception as exc:
-                print(f"    [warn] {exc}")
-            if done % 20 == 0:
-                print(f"    {done}/{len(tasks)} done")
+    completed = execute_cached_tasks(
+        tasks,
+        _worker_part2,
+        cache_root=os.path.join(_root, "_run_cache"),
+        namespace="comm_compression_sweep",
+        max_workers=_N_WORKERS,
+    )
+    for obj_name, label, mc_idx, relF, commCost, failed, reason, error in completed:
+        raw.setdefault((obj_name, label), []).append(
+            (mc_idx, np.array(relF), np.array(commCost), failed, reason, error)
+        )
 
     config_labels = [c[0] for c in configs]
     curves_by_func = {}
     for obj_name in _COMM_FUNCS:
         curves = []
         for label in config_labels:
-            runs = raw.get((obj_name, label), [])
+            runs = [
+                run
+                for run in raw.get((obj_name, label), [])
+                if not run[3] and len(run[1]) > 0
+            ]
             if not runs:
                 curves.append((label, None, None))
                 continue
-            max_len = max(len(r) for r, _ in runs)
+            max_len = max(len(run[1]) for run in runs)
             relF_mat = np.full((_NSTART, max_len), np.nan)
             comm_mat = np.full((_NSTART, max_len), np.nan)
-            for si, (rF, cC) in enumerate(runs):
+            for si, (_, rF, cC, _, _, _) in enumerate(sorted(runs)):
                 relF_mat[si, :len(rF)] = rF
                 comm_mat[si, :len(cC)] = cC
             curves.append((label,
-                           np.nanmean(relF_mat, axis=0),
-                           np.nanmean(comm_mat, axis=0)))
+                           nanmean_columns(relF_mat),
+                           nanmean_columns(comm_mat)))
         curves_by_func[obj_name] = curves
 
     fig_comm_ablation(curves_by_func, _COMM_FUNCS,
                       "Compression Sweep (CeDisGrem)", "compress_sweep",
                       results_dir, cmap_name="RdYlGn")
+    write_json_gz(
+        os.path.join(results_dir, "data_log", "raw_compression_sweep.json.gz"),
+        {
+            "schema_version": 1,
+            "mode": "comm",
+            "study": "compression_sweep",
+            "runs": [
+                {
+                    "objective": objective,
+                    "configuration": label,
+                    "mc_index": mc_index,
+                    "seed": 300 + mc_index,
+                    "relF": rel_f,
+                    "commCost": comm_cost,
+                    "failed": failed,
+                    "failure_reason": reason,
+                    "exception": error,
+                }
+                for (objective, label), indexed in sorted(raw.items())
+                for mc_index, rel_f, comm_cost, failed, reason, error in sorted(indexed)
+            ],
+        },
+    )
     print("  Part 2b done.")
 
 
@@ -402,5 +505,3 @@ def run_comm(part: str = "all") -> None:
         _run_part2b(results_dir)
 
     print("\n[run_comm] All done.")
-
-

@@ -1,62 +1,95 @@
-"""
-Quick smoke test: run all MainComp algorithms on ridge and logsumexp.
-Checks that all algorithms converge without crashes.
-"""
+"""Fast executable contracts for the experiment and solver registry."""
+
+from __future__ import annotations
+
 import sys
 from pathlib import Path
+
+import numpy as np
+import pytest
 
 _CODES_ROOT = Path(__file__).resolve().parents[1]
 if str(_CODES_ROOT) not in sys.path:
     sys.path.insert(0, str(_CODES_ROOT))
 
-import numpy as np
+from experiments.benchmarks.run_regular import _worker_mc_regular
 from utils.alg.alg_bank import get_alg_bank
-from utils.helper.graph import generate_random_graph
-from problems.obj_factory import obj_factory
+from utils.helper.graph import generate_fully_connected_graph, spectral_gap
+from utils.data.load_dataset import load_dataset
 
-N, d = 6, 5
-np.random.seed(0)
-W, _ = generate_random_graph(N, 0.7)
 
-mc = get_alg_bank('MainComp')
-objectives = ['ridge', 'logsumexp']
+def _small_protocol() -> dict[str, object]:
+    return {
+        "Nagent": 4,
+        "p_edge": 0.8,
+        "maxIt": 4,
+        "iteration_budget_override": 4,
+        "tol": 1e-12,
+        "tolType": "combo",
+        "verbose": False,
+        "showPlots": False,
+        "far": False,
+        "useWorst": False,
+        "nStart": 1,
+        "d_override": 3,
+        "info": 2,
+        "NC": 1,
+        "NC_schedule": "fixed",
+        "log_p": 3.0,
+        "log_c_mix": 2.0,
+        "NC_max": 2,
+        "countComm": True,
+    }
 
-# Base prm (alpha will be set per-function)
-def run_test(fname, alpha_val, M_factor=0.1):
-    result = obj_factory(fname, N, d)
-    f_list = result[0]
-    x_opt = result[3][0]
-    f_opt = float(result[4][0])
-    fparam = result[7]
-    L_max = float(result[2].max())
-    alpha = alpha_val / max(L_max, 1e-3)
-    np.random.seed(42)
-    x0 = np.random.randn(d) * 0.1
-    M_val = M_factor * L_max
 
-    print(f"\n{'='*70}")
-    print(f"  {fname}  (N={N}, d={d}, alpha={alpha:.4g}, M={M_val:.3g}, L_max={L_max:.3g})")
-    print(f"{'='*70}")
+def test_regular_worker_executes_every_main_algorithm() -> None:
+    index, logs, f0 = _worker_mc_regular(("ridge", 0, _small_protocol()))
 
-    for name, fn in mc:
-        prm = dict(Nagent=N, dim=d, f=f_list, W=W, x_opt=x_opt, f_opt=f_opt,
-                   alpha=alpha, M=M_val, esom_penalty=M_val,
-                   nt_cons_weight=1.0, nt_max_step=5.0,
-                   info=2, fname=fname, fparam=fparam,
-                   maxIt=300, tol=1e-8, tolType='combo',
-                   verbose=False, countComm=True, NC=1)
-        try:
-            _, log = fn(x0.copy(), prm)
-            c = log['combo']; c = c[~np.isnan(c)]
-            rf = log['relF']; rf = rf[~np.isnan(rf)]
-            steps = len(c)
-            fin_combo = float(c[-1]) if steps else float('nan')
-            fin_rf = float(rf[-1]) if len(rf) else float('nan')
-            status = 'OK' if fin_combo < 1e-6 else ('DIVG' if fin_combo > 10 else 'partial')
-            print(f"  {name:20s}  steps={steps:4d}  combo={fin_combo:.2e}  relF={fin_rf:.2e}  [{status}]")
-        except Exception as e:
-            print(f"  {name:20s}  CRASH: {e}")
+    assert index == 0
+    assert np.isfinite(f0)
+    assert set(logs) == {name for name, _ in get_alg_bank("MainComp")}
+    proposed = {"DisGrem", "CeDisGrem", "AdaDisGrem", "CeAdaDisGrem"}
+    for name, record in logs.items():
+        values = np.asarray(record.get("ValueF", []), dtype=float)
+        assert values.size > 0, name
+        if name in proposed:
+            assert not record.get("fail"), f"{name}: {record.get('failReason')}"
+            assert np.all(np.isfinite(values)), name
+        elif not np.all(np.isfinite(values)):
+            assert record.get("fail") or record.get("__failed__"), name
+            assert record.get("failReason"), name
 
-run_test('ridge', 0.2, M_factor=0.1)
-run_test('logsumexp', 0.4, M_factor=20.0)
-print("\nSmoke test done.")
+
+def test_regular_worker_is_seed_reproducible() -> None:
+    first = _worker_mc_regular(("ridge", 2, _small_protocol()))
+    second = _worker_mc_regular(("ridge", 2, _small_protocol()))
+
+    assert first[2] == pytest.approx(second[2], rel=0.0, abs=0.0)
+    for name in first[1]:
+        np.testing.assert_allclose(
+            first[1][name]["ValueF"],
+            second[1][name]["ValueF"],
+            rtol=0.0,
+            atol=0.0,
+        )
+
+
+def test_complete_graph_has_exact_consensus_matrix() -> None:
+    adjacency, weights = generate_fully_connected_graph(5)
+
+    np.testing.assert_allclose(adjacency, np.ones((5, 5)) - np.eye(5))
+    np.testing.assert_allclose(weights.sum(axis=0), np.ones(5))
+    np.testing.assert_allclose(weights.sum(axis=1), np.ones(5))
+    assert spectral_gap(weights) == pytest.approx(1.0)
+
+
+def test_dataset_loader_reuses_immutable_arrays() -> None:
+    load_dataset.cache_clear()
+    first = load_dataset("svmguide3", standardize="zscore", label_style="pm1")
+    second = load_dataset("svmguide3", standardize="zscore", label_style="pm1")
+
+    assert first[0] is second[0]
+    assert first[1] is second[1]
+    assert not first[0].flags.writeable
+    assert not first[1].flags.writeable
+    assert load_dataset.cache_info().hits == 1

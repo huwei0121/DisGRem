@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import ssl
 import urllib.request
+from functools import lru_cache
 import numpy as np
 from scipy.sparse import issparse
 from pathlib import Path
@@ -23,6 +24,7 @@ _LIBSVM_DATASETS = {
 _BASE_URL = "https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/binary/"
 
 
+@lru_cache(maxsize=16)
 def load_dataset(name: str,
                  standardize: str = "none",
                  label_style: str = "raw",
@@ -104,6 +106,8 @@ def load_dataset(name: str,
         if set(uniq).issubset({-1, 1}):
             b = (b + 1) / 2
 
+    A.setflags(write=False)
+    b.setflags(write=False)
     print(f"Loaded {name_l}: m={m}, d={d}")
     return A, b
 

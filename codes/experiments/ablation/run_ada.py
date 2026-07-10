@@ -4,21 +4,19 @@ run_ada.py -Adaptive-mechanism study for AdaDisGrem.
 Three experiments on 4 representative functions:
 
   1. M trajectory  -plot M(t) for AdaDisGrem / CeAdaDisGrem vs DisGrem's fixed M.
-  2. Ada vs Fixed-M  -compare relF convergence of Ada (auto M) against DisGrem
-     run at 5 manually-chosen fixed M values 鈫?shows Ada eliminates manual tuning.
+  2. Ada vs Fixed-M - compare relF convergence of Ada (auto M) against DisGrem
+     run at five manually chosen fixed M values.
   3. Initial-M robustness  -run Ada from 5 different initial M values and show
      that M trajectories converge to a similar operating point.
 
 Functions: ridge, logsumexp, logreg_real, logreg_ncvr
-Output: results_ada/paper/ada_mechanism/
+Output: results/ada/paper/ada_mechanism/
 """
 
 from __future__ import annotations
 import os
 import sys
-import time
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _root not in sys.path:
@@ -32,6 +30,13 @@ from utils.helper.run_utils import detect_diverged
 from utils.export.plot_utils import (fig_ada_m_trajectory,
                                       fig_ada_vs_fixed_m,
                                       fig_ada_init_m_robust)
+from experiments.protocol import (
+    configured_iteration_override,
+    execute_cached_tasks,
+    nanmean_columns,
+    resolve_iteration_budget,
+    write_json_gz,
+)
 
 
 _ADA_FUNCS = ["ridge", "logsumexp", "logreg_real", "logreg_ncvr"]
@@ -46,7 +51,7 @@ _N_WORKERS = min(8, max(1, (os.cpu_count() or 4) - 2))
 
 def _make_prm(P, policy, fun_list, d, L_vec,
               x_opt_list, f_opt_list, fname, fparam, W):
-    maxIt_obj = policy.get("maxIt", P["maxIt"])
+    maxIt_obj = resolve_iteration_budget(policy, P)
     prm = dict(P)
     prm["maxIt"] = maxIt_obj
     if "tolType" in policy:
@@ -141,7 +146,7 @@ def _average_outs(results_list, nstart):
             arr = np.asarray(o.get(f_name, []), dtype=float)
             n = min(len(arr), max_len)
             mat[si, :n] = arr[:n]
-        avg[f_name] = np.nanmean(mat, axis=0).tolist()
+        avg[f_name] = nanmean_columns(mat).tolist()
     return avg
 
 
@@ -159,22 +164,45 @@ def _exp1_trajectory(results_dir, P, param_bank, M_alpha_policy, x0_generator):
 
     print(f"    {len(tasks)} tasks on {_N_WORKERS} workers")
     raw = {}
-    with ProcessPoolExecutor(max_workers=_N_WORKERS) as pool:
-        futs = {pool.submit(_worker_ada_mc, t): t for t in tasks}
-        for fut in as_completed(futs):
-            obj_name, alg_name, mc_idx, _, result = fut.result()
-            raw.setdefault((obj_name, alg_name), []).append(result)
+    completed = execute_cached_tasks(
+        tasks,
+        _worker_ada_mc,
+        cache_root=os.path.join(_root, "_run_cache"),
+        namespace="ada_m_trajectory",
+        max_workers=_N_WORKERS,
+    )
+    for obj_name, alg_name, mc_idx, _, result in completed:
+        raw.setdefault((obj_name, alg_name), []).append((mc_idx, result))
 
     logs = {}
     for obj_name in _ADA_FUNCS:
         obj_log = {}
         for an in alg_list:
-            runs = raw.get((obj_name, an), [])
+            runs = [result for _, result in sorted(raw.get((obj_name, an), []))]
             obj_log[an] = _average_outs(runs, _NSTART)
         logs[obj_name] = obj_log
         print(f"    {obj_name} done")
 
     fig_ada_m_trajectory(logs, _ADA_FUNCS, results_dir)
+    write_json_gz(
+        os.path.join(results_dir, "data_log", "raw_m_trajectory.json.gz"),
+        {
+            "schema_version": 1,
+            "mode": "ada",
+            "study": "m_trajectory",
+            "runs": [
+                {
+                    "objective": objective,
+                    "algorithm": algorithm,
+                    "mc_index": mc_index,
+                    "seed": 700 + mc_index,
+                    "metrics": result,
+                }
+                for (objective, algorithm), indexed in sorted(raw.items())
+                for mc_index, result in sorted(indexed)
+            ],
+        },
+    )
     return logs
 
 
@@ -205,11 +233,15 @@ def _exp2_fixed_m(results_dir, P, param_bank, M_alpha_policy, x0_generator,
 
     print(f"    {len(tasks)} tasks on {_N_WORKERS} workers")
     raw = {}
-    with ProcessPoolExecutor(max_workers=_N_WORKERS) as pool:
-        futs = {pool.submit(_worker_ada_mc, t): t for t in tasks}
-        for fut in as_completed(futs):
-            obj_name, _, mc_idx, M_over, result = fut.result()
-            raw.setdefault((obj_name, M_over), []).append(result)
+    completed = execute_cached_tasks(
+        tasks,
+        _worker_ada_mc,
+        cache_root=os.path.join(_root, "_run_cache"),
+        namespace="ada_fixed_m",
+        max_workers=_N_WORKERS,
+    )
+    for obj_name, _, mc_idx, M_over, result in completed:
+        raw.setdefault((obj_name, M_over), []).append((mc_idx, result))
 
     ada_log = {}
     fixed_m_logs = {}
@@ -220,13 +252,32 @@ def _exp2_fixed_m(results_dir, P, param_bank, M_alpha_policy, x0_generator,
         fm = {}
         for mf in _FIXED_M_FACTORS:
             M_val = base_M * mf
-            runs = raw.get((obj_name, M_val), [])
+            runs = [result for _, result in sorted(raw.get((obj_name, M_val), []))]
             fm[mf] = _average_outs(runs, _NSTART)
         fixed_m_logs[obj_name] = fm
         print(f"    {obj_name} done")
 
     fig_ada_vs_fixed_m(ada_log, fixed_m_logs, _FIXED_M_FACTORS,
                         _ADA_FUNCS, results_dir)
+    write_json_gz(
+        os.path.join(results_dir, "data_log", "raw_ada_vs_fixed_m.json.gz"),
+        {
+            "schema_version": 1,
+            "mode": "ada",
+            "study": "ada_vs_fixed_m",
+            "runs": [
+                {
+                    "objective": objective,
+                    "M": m_value,
+                    "mc_index": mc_index,
+                    "seed": 700 + mc_index,
+                    "metrics": result,
+                }
+                for (objective, m_value), indexed in sorted(raw.items())
+                for mc_index, result in sorted(indexed)
+            ],
+        },
+    )
 
 
 #  Experiment 3 -Initial-M robustness (parallelized)
@@ -255,11 +306,15 @@ def _exp3_init_m(results_dir, P, param_bank, M_alpha_policy, x0_generator):
 
     print(f"    {len(tasks)} tasks on {_N_WORKERS} workers")
     raw = {}
-    with ProcessPoolExecutor(max_workers=_N_WORKERS) as pool:
-        futs = {pool.submit(_worker_ada_mc, t): t for t in tasks}
-        for fut in as_completed(futs):
-            obj_name, _, mc_idx, M_over, result = fut.result()
-            raw.setdefault((obj_name, M_over), []).append(result)
+    completed = execute_cached_tasks(
+        tasks,
+        _worker_ada_mc,
+        cache_root=os.path.join(_root, "_run_cache"),
+        namespace="ada_initial_m",
+        max_workers=_N_WORKERS,
+    )
+    for obj_name, _, mc_idx, M_over, result in completed:
+        raw.setdefault((obj_name, M_over), []).append((mc_idx, result))
 
     init_m_logs = {}
     for obj_name in _ADA_FUNCS:
@@ -267,13 +322,32 @@ def _exp3_init_m(results_dir, P, param_bank, M_alpha_policy, x0_generator):
         im = {}
         for mf in _INIT_M_FACTORS:
             M_val = base_M * mf
-            runs = raw.get((obj_name, M_val), [])
+            runs = [result for _, result in sorted(raw.get((obj_name, M_val), []))]
             im[mf] = _average_outs(runs, _NSTART)
         init_m_logs[obj_name] = im
         print(f"    {obj_name} done")
 
     fig_ada_init_m_robust(init_m_logs, _INIT_M_FACTORS,
                            _ADA_FUNCS, results_dir)
+    write_json_gz(
+        os.path.join(results_dir, "data_log", "raw_initial_m_robustness.json.gz"),
+        {
+            "schema_version": 1,
+            "mode": "ada",
+            "study": "initial_m_robustness",
+            "runs": [
+                {
+                    "objective": objective,
+                    "initial_M": m_value,
+                    "mc_index": mc_index,
+                    "seed": 700 + mc_index,
+                    "metrics": result,
+                }
+                for (objective, m_value), indexed in sorted(raw.items())
+                for mc_index, result in sorted(indexed)
+            ],
+        },
+    )
 
 
 #  Entry point
@@ -283,9 +357,11 @@ def run_ada() -> None:
     results_dir = os.path.join(_root, "results", "ada")
     os.makedirs(results_dir, exist_ok=True)
     os.makedirs(os.path.join(results_dir, "paper", "ada_mechanism"), exist_ok=True)
+    os.makedirs(os.path.join(results_dir, "data_log"), exist_ok=True)
 
     P = {
         "Nagent": 10, "p_edge": 0.5, "maxIt": int(os.environ.get("LOG_SCHEDULE_MAXIT", "500")),
+        "iteration_budget_override": configured_iteration_override(),
         "tol": 1e-12, "tolType": "combo",
         "verbose": False, "NC": 3, "NC_schedule": "log", "log_p": 3.0, "log_c_mix": 2.0, "NC_max": 10, "info": 2,
         "countComm": True, "d_override": 30,
@@ -308,5 +384,3 @@ def run_ada() -> None:
     _exp3_init_m(results_dir, P, param_bank, M_alpha_policy, x0_generator)
 
     print("\n[run_ada] All done.")
-
-

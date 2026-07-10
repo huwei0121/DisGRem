@@ -10,9 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import time
-import pickle
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _root not in sys.path:
@@ -24,6 +22,12 @@ from problems.init_policy import init_policy
 from utils.helper.graph import generate_random_graph
 from utils.export.log_export import merge_logs
 from utils.helper.run_utils import detect_diverged
+from experiments.protocol import (
+    configured_iteration_override,
+    execute_cached_tasks,
+    resolve_iteration_budget,
+    write_json_gz,
+)
 
 _N_WORKERS = min(8, max(1, (os.cpu_count() or 4) - 2))
 
@@ -58,7 +62,10 @@ def _worker(args):
 
     policy = M_alpha_policy.get(obj_name, {"M_factor": 1.0, "alpha": 0.1,
                                             "decay": False, "maxIt": 500})
-    maxIt_obj = _MAXITS.get(obj_name, {}).get(d_val, policy.get("maxIt", 500))
+    dimension_policy = {
+        "maxIt": _MAXITS.get(obj_name, {}).get(d_val, policy.get("maxIt", 500))
+    }
+    maxIt_obj = resolve_iteration_budget(dimension_policy, P_dict)
     M_val = policy["M_factor"] * float(L_vec.max())
     alp_val = policy["alpha"] / float(L_vec.max())
 
@@ -107,6 +114,7 @@ def run_scalability() -> dict:
 
     P = {
         "Nagent": 10, "p_edge": 0.5, "maxIt": int(os.environ.get("LOG_SCHEDULE_MAXIT", "500")),
+        "iteration_budget_override": configured_iteration_override(),
         "tol": 1e-12, "tolType": "combo", "verbose": False,
         "showPlots": False, "far": False, "useWorst": False,
         "nStart": _N_MC, "d_override": 30, "info": 2, "NC": 3, "NC_schedule": "log", "log_p": 3.0, "log_c_mix": 2.0, "NC_max": 10,
@@ -122,64 +130,69 @@ def run_scalability() -> dict:
         os.environ[k] = "1"
 
     all_results = {}
-    cache_dir = os.path.join(_root, "_run_cache", "scalability")
-    os.makedirs(cache_dir, exist_ok=True)
 
     try:
-        with ProcessPoolExecutor(max_workers=_N_WORKERS) as pool:
-            for obj_name in _FUNCTIONS:
-                for d_val in _DIMS:
-                    key = f"{obj_name}_d{d_val}"
-                    cache_path = os.path.join(cache_dir, f"{key}.pkl")
+        for obj_name in _FUNCTIONS:
+            for d_val in _DIMS:
+                key = f"{obj_name}_d{d_val}"
+                print(f"\n{'='*50}")
+                print(f"  {obj_name}  d={d_val}  ({_N_MC} MC, "
+                      f"{_N_WORKERS} workers)")
+                print(f"{'='*50}")
 
-                    if os.path.isfile(cache_path):
-                        print(f"[resume] Loading cached: {key}")
-                        with open(cache_path, "rb") as fh:
-                            all_results[key] = pickle.load(fh)
-                        continue
+                t0 = time.perf_counter()
+                P_run = dict(P)
+                P_run["d_override"] = d_val
+                tasks = [(obj_name, d_val, sample, P_run) for sample in range(_N_MC)]
+                completed = execute_cached_tasks(
+                    tasks,
+                    _worker,
+                    cache_root=os.path.join(_root, "_run_cache"),
+                    namespace=f"scale_{key}",
+                    max_workers=_N_WORKERS,
+                    progress_every=1,
+                )
 
-                    print(f"\n{'='*50}")
-                    print(f"  {obj_name}  d={d_val}  ({_N_MC} MC, "
-                          f"{_N_WORKERS} workers)")
-                    print(f"{'='*50}")
+                logs_each = [None] * _N_MC
+                f0_vals = [0.0] * _N_MC
+                for idx, log_s, f0_val in completed:
+                    logs_each[idx] = log_s
+                    f0_vals[idx] = f0_val
+                    print(f"  MC #{idx+1} ready", flush=True)
 
-                    t0 = time.perf_counter()
+                elapsed = time.perf_counter() - t0
+                print(f"  [{key}] ready in {elapsed:.1f}s")
 
-                    P_run = dict(P)
-                    P_run["d_override"] = d_val
-                    tasks = [(obj_name, d_val, s, P_run) for s in range(_N_MC)]
-                    futures = {pool.submit(_worker, t): t[2] for t in tasks}
+                obj_args = param_bank.get(obj_name, [d_val])
+                if obj_args and isinstance(obj_args[0], (int, float)):
+                    obj_args = [d_val] + list(obj_args[1:])
+                fun_list, d, L_vec, x_opt_list, f_opt_list, _, _, _ = \
+                    obj_factory(obj_name, P["Nagent"], *obj_args)
 
-                    logs_each = [None] * _N_MC
-                    f0_vals = [0.0] * _N_MC
+                f0_val = f0_vals[-1] if f0_vals else np.nan
+                f_star = float(np.mean(f_opt_list))
+                log_merged = merge_logs(logs_each, False, f0_val, f_star, use_median=True)
+                all_results[key] = log_merged
 
-                    for fut in as_completed(futures):
-                        mc_idx = futures[fut]
-                        try:
-                            idx, log_s, f0_val = fut.result()
-                            logs_each[idx] = log_s
-                            f0_vals[idx] = f0_val
-                            print(f"  MC #{idx+1} done", flush=True)
-                        except Exception as exc:
-                            print(f"  MC #{mc_idx+1} FAILED: {exc}")
-                            logs_each[mc_idx] = {}
-
-                    elapsed = time.perf_counter() - t0
-                    print(f"  [{key}] done in {elapsed:.1f}s")
-
-                    obj_args = param_bank.get(obj_name, [d_val])
-                    if obj_args and isinstance(obj_args[0], (int, float)):
-                        obj_args = [d_val] + list(obj_args[1:])
-                    fun_list, d, L_vec, x_opt_list, f_opt_list, _, _, _ = \
-                        obj_factory(obj_name, P["Nagent"], *obj_args)
-
-                    f0_val = f0_vals[-1] if f0_vals else np.nan
-                    f_star = float(np.mean(f_opt_list))
-                    log_merged = merge_logs(logs_each, False, f0_val, f_star, use_median=True)
-                    all_results[key] = log_merged
-
-                    with open(cache_path, "wb") as fh:
-                        pickle.dump(log_merged, fh, protocol=4)
+                raw_payload = {
+                    "schema_version": 1,
+                    "mode": "scale",
+                    "objective": obj_name,
+                    "dimension": d_val,
+                    "runs": [
+                        {
+                            "mc_index": index,
+                            "seed": 200 + index,
+                            "initial_objective": f0_vals[index],
+                            "algorithms": run,
+                        }
+                        for index, run in enumerate(logs_each)
+                    ],
+                }
+                write_json_gz(
+                    os.path.join(results_dir, "data_log", f"raw_{key}.json.gz"),
+                    raw_payload,
+                )
     finally:
         for k, v in _orig_env.items():
             if v is None:
@@ -262,5 +275,3 @@ def _plot_scalability_grid(all_results: dict, results_dir: str) -> None:
 
 if __name__ == "__main__":
     run_scalability()
-
-

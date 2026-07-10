@@ -8,9 +8,7 @@ import os
 import sys
 import shutil
 import time
-import pickle
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _root not in sys.path:
@@ -26,6 +24,12 @@ from utils.export.plot_utils import (fig_plot_custom, fig_plot_multiobj_custom,
                                       fig_perf_profiles_tol_panel,
                                       fig_perf_profiles_comm_panel)
 from utils.helper.run_utils import detect_diverged
+from experiments.protocol import (
+    configured_iteration_override,
+    execute_cached_tasks,
+    resolve_iteration_budget,
+    write_json_gz,
+)
 
 _N_WORKERS = min(10, max(1, (os.cpu_count() or 4) - 2))
 
@@ -61,7 +65,7 @@ def _worker_mc_regular(args):
         os.environ[k] = "1"
 
     alg_bank = get_alg_bank("MainComp")
-    param_bank, M_alpha_policy, _ = init_policy("regular")
+    param_bank, M_alpha_policy, x0_generator = init_policy("regular")
 
     obj_args = param_bank.get(obj_name, [P_dict["d_override"]])
     if obj_args and isinstance(obj_args[0], (int, float)):
@@ -72,7 +76,7 @@ def _worker_mc_regular(args):
 
     policy = M_alpha_policy.get(obj_name, {"M_factor": 1.0, "alpha": 0.1,
                                             "decay": False, "maxIt": P_dict["maxIt"]})
-    maxIt_obj = policy.get("maxIt", P_dict["maxIt"])
+    maxIt_obj = resolve_iteration_budget(policy, P_dict)
     M_val = policy["M_factor"] * float(L_vec.max())
     alp_val = policy["alpha"] / float(L_vec.max())
 
@@ -133,6 +137,7 @@ def run_regular(func_group: str = "all") -> None:
         "Nagent":      10,
         "p_edge":      0.5,
         "maxIt":       int(os.environ.get("LOG_SCHEDULE_MAXIT", "500")),
+        "iteration_budget_override": configured_iteration_override(),
         "tol":         1e-12,
         "tolType":     "combo",
         "verbose":     True,
@@ -165,9 +170,6 @@ def run_regular(func_group: str = "all") -> None:
 
     all_logs = {}
     all_individual = {}
-    cache_dir = os.path.join(_root, "_run_cache", "regular")
-    os.makedirs(cache_dir, exist_ok=True)
-    use_cache = os.environ.get("DISGREM_USE_CACHE", "0") == "1"
 
     # Force single-threaded BLAS in spawned workers
     _orig_env = {}
@@ -177,115 +179,109 @@ def run_regular(func_group: str = "all") -> None:
         os.environ[k] = "1"
 
     try:
-        with ProcessPoolExecutor(max_workers=_N_WORKERS) as pool:
-            for obj_name in obj_list:
-                # -- resume from cache --------------------------------
-                cache_path = os.path.join(cache_dir, f"{obj_name}.pkl")
-                if use_cache and os.path.isfile(cache_path):
-                    print(f"\n[resume] Loading cached results for {obj_name}")
-                    with open(cache_path, "rb") as fh:
-                        payload = pickle.load(fh)
-                    if (isinstance(payload, dict)
-                            and "merged" in payload
-                            and "individual" in payload):
-                        all_logs[obj_name] = payload["merged"]
-                        all_individual[obj_name] = payload["individual"]
-                    else:
-                        all_logs[obj_name] = payload
-                    continue
+        for obj_name in obj_list:
+            print(f"\n{'='*60}")
+            print(f" Objective: {obj_name}  ({_N_WORKERS} workers x "
+                  f"{P['nStart']} MC)")
+            print(f"{'='*60}")
 
-                print(f"\n{'='*60}")
-                print(f" Objective: {obj_name}  ({_N_WORKERS} workers x "
-                      f"{P['nStart']} MC)")
-                print(f"{'='*60}")
+            t0_func = time.perf_counter()
+            tasks = [(obj_name, sample, P) for sample in range(P["nStart"])]
+            completed = execute_cached_tasks(
+                tasks,
+                _worker_mc_regular,
+                cache_root=os.path.join(_root, "_run_cache"),
+                namespace=f"regular_{obj_name}",
+                max_workers=_N_WORKERS,
+                progress_every=5,
+            )
 
-                t0_func = time.perf_counter()
+            logs_each = [None] * P["nStart"]
+            f0_vals = [0.0] * P["nStart"]
+            for idx, log_s, f0_val in completed:
+                logs_each[idx] = log_s
+                f0_vals[idx] = f0_val
+                n_div = sum(1 for value in log_s.values() if value.get("__failed__"))
+                tag = f" ({n_div} div)" if n_div else ""
+                print(f"  MC #{idx+1:2d} ready{tag}", flush=True)
 
-                # Dispatch all MC runs
-                tasks = [(obj_name, s, P) for s in range(P["nStart"])]
-                futures = {pool.submit(_worker_mc_regular, t): t[1]
-                           for t in tasks}
+            elapsed_func = time.perf_counter() - t0_func
+            print(f"  [{obj_name}] all {P['nStart']} MC ready in "
+                  f"{elapsed_func:.1f}s")
 
-                logs_each = [None] * P["nStart"]
-                f0_vals = [0.0] * P["nStart"]
-                done = 0
+            # -- merge & export -----------------------------------
+            f0_val = f0_vals[-1] if f0_vals else np.nan
 
-                for fut in as_completed(futures):
-                    mc_idx = futures[fut]
-                    try:
-                        idx, log_s, f0_val = fut.result()
-                        logs_each[idx] = log_s
-                        f0_vals[idx] = f0_val
+            # Rebuild prm for summary (need obj metadata)
+            obj_args = param_bank.get(obj_name, [P["d_override"]])
+            if obj_args and isinstance(obj_args[0], (int, float)):
+                obj_args = [P["d_override"]] + list(obj_args[1:])
+            fun_list, d, L_vec, x_opt_list, f_opt_list, _, fname, fparam = \
+                obj_factory(obj_name, P["Nagent"], *obj_args)
+            policy = M_alpha_policy.get(
+                obj_name, {"M_factor": 1.0, "alpha": 0.1,
+                           "decay": False, "maxIt": P["maxIt"]})
+            prm = dict(P)
+            prm["maxIt"] = resolve_iteration_budget(policy, P)
+            if "tolType" in policy:
+                prm["tolType"] = policy["tolType"]
+            prm.update({
+                "f": fun_list, "fname": fname, "fparam": fparam,
+                "dim": d,
+                "M": policy["M_factor"] * float(L_vec.max()),
+                "alpha": policy["alpha"] / float(L_vec.max()),
+                "decay_alpha": policy["decay"], "objName": obj_name,
+                "x_opt": x_opt_list[0] if x_opt_list else None,
+                "f_opt": float(np.mean(f_opt_list)),
+                "esom_penalty": 1.0,
+            })
 
-                        n_div = sum(1 for v in log_s.values()
-                                    if v.get("__failed__"))
-                        tag = f" ({n_div} div)" if n_div else ""
-                        print(f"  MC #{idx+1:2d} done{tag}", flush=True)
-                    except Exception as exc:
-                        print(f"  MC #{mc_idx+1:2d} FAILED: {exc}")
-                        logs_each[mc_idx] = {}
-                    done += 1
+            log_merged = merge_logs(logs_each, P["useWorst"],
+                                     f0_val, prm["f_opt"], use_median=True)
+            all_logs[obj_name] = log_merged
+            all_individual[obj_name] = logs_each
 
-                elapsed_func = time.perf_counter() - t0_func
-                print(f"  [{obj_name}] all {P['nStart']} MC done in "
-                      f"{elapsed_func:.1f}s")
+            write_json_gz(
+                os.path.join(results_dir, "data_log", f"raw_{obj_name}.json.gz"),
+                {
+                    "schema_version": 1,
+                    "mode": "regular",
+                    "objective": obj_name,
+                    "configuration": {
+                        key: value
+                        for key, value in P.items()
+                        if key not in {"f", "W"}
+                    },
+                    "initial_objectives": f0_vals,
+                    "runs": [
+                        {
+                            "mc_index": index,
+                            "seed": 100 + index,
+                            "algorithms": run,
+                        }
+                        for index, run in enumerate(logs_each)
+                    ],
+                },
+            )
 
-                # -- merge & export -----------------------------------
-                f0_val = f0_vals[-1] if f0_vals else np.nan
+            if P["showPlots"]:
+                for x_key, y_key in [("steps",    "combo"),
+                                      ("timeCost", "combo"),
+                                      ("steps",    "relF"),
+                                      ("timeCost", "relF"),
+                                      ("commCost", "relF"),
+                                      ("commCost", "combo")]:
+                    fig_plot_custom(log_merged, alg_bank, x_key, y_key,
+                                    "semilogy", results_dir, obj_name)
 
-                # Rebuild prm for summary (need obj metadata)
-                obj_args = param_bank.get(obj_name, [P["d_override"]])
-                if obj_args and isinstance(obj_args[0], (int, float)):
-                    obj_args = [P["d_override"]] + list(obj_args[1:])
-                fun_list, d, L_vec, x_opt_list, f_opt_list, _, fname, fparam = \
-                    obj_factory(obj_name, P["Nagent"], *obj_args)
-                policy = M_alpha_policy.get(
-                    obj_name, {"M_factor": 1.0, "alpha": 0.1,
-                               "decay": False, "maxIt": P["maxIt"]})
-                prm = dict(P)
-                prm["maxIt"] = policy.get("maxIt", P["maxIt"])
-                if "tolType" in policy:
-                    prm["tolType"] = policy["tolType"]
-                prm.update({
-                    "f": fun_list, "fname": fname, "fparam": fparam,
-                    "dim": d,
-                    "M": policy["M_factor"] * float(L_vec.max()),
-                    "alpha": policy["alpha"] / float(L_vec.max()),
-                    "decay_alpha": policy["decay"], "objName": obj_name,
-                    "x_opt": x_opt_list[0] if x_opt_list else None,
-                    "f_opt": float(np.mean(f_opt_list)),
-                    "esom_penalty": 1.0,
-                })
+            write_txt_summary(results_dir, log_merged, alg_bank,
+                              obj_name, "regular", prm, f0_val,
+                              prm["f_opt"])
 
-                log_merged = merge_logs(logs_each, P["useWorst"],
-                                         f0_val, prm["f_opt"], use_median=True)
-                all_logs[obj_name] = log_merged
-                all_individual[obj_name] = logs_each
-
-                with open(os.path.join(cache_dir, f"{obj_name}.pkl"),
-                          "wb") as fh:
-                    pickle.dump({"merged": log_merged,
-                                 "individual": logs_each}, fh,
-                                protocol=pickle.HIGHEST_PROTOCOL)
-
-                if P["showPlots"]:
-                    for x_key, y_key in [("steps",    "combo"),
-                                          ("timeCost", "combo"),
-                                          ("steps",    "relF"),
-                                          ("timeCost", "relF"),
-                                          ("commCost", "relF"),
-                                          ("commCost", "combo")]:
-                        fig_plot_custom(log_merged, alg_bank, x_key, y_key,
-                                        "semilogy", results_dir, obj_name)
-
-                write_txt_summary(results_dir, log_merged, alg_bank,
-                                  obj_name, "regular", prm, f0_val,
-                                  prm["f_opt"])
-
-                excel_path = os.path.join(results_dir, "data_log",
-                                          "exp_full_record.xlsx")
-                write_log_to_excel(logs_each, alg_bank, obj_name, prm,
-                                   f0_val, prm["f_opt"], excel_path)
+            excel_path = os.path.join(results_dir, "data_log",
+                                      "exp_full_record.xlsx")
+            write_log_to_excel(logs_each, alg_bank, obj_name, prm,
+                               f0_val, prm["f_opt"], excel_path)
 
     finally:
         for k, v in _orig_env.items():
@@ -319,6 +315,3 @@ def run_regular(func_group: str = "all") -> None:
                                      all_individual=all_individual)
 
     print("\n[run_regular] All done.")
-
-
-

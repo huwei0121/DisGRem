@@ -13,8 +13,9 @@ Part 2 - Parameter sensitivity
   3 algorithm groups x 4 functions:
     DisGrem (no Ada) : DisGrem, CeDisGrem - sweep alpha and M
     First-order      : EXTRA, DIGing - sweep alpha
-    Second-order     : DQM, ESOM, SONATA, NetworkGIANT - sweep alpha
-  Output: 12 gradient-colour sweep figures.
+    Second-order     : DQM, ESOM, SONATA, NetworkGIANT - sweep one declared
+                       algorithm-specific damping or step parameter
+  Output: one combined gradient-colour figure per algorithm group.
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ import sys
 import csv
 import time
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _root not in sys.path:
@@ -36,6 +36,13 @@ from utils.helper.graph import generate_random_graph
 from utils.helper.run_utils import detect_diverged
 from utils.export.plot_utils import (fig_success_rate_table,
                                       fig_param_sweep_combined)
+from experiments.protocol import (
+    configured_iteration_override,
+    execute_cached_tasks,
+    nanmean_columns,
+    resolve_iteration_budget,
+    write_json_gz,
+)
 
 
 #  Constants
@@ -66,19 +73,33 @@ def _sample_in_ball(center: np.ndarray, radius: float,
     return center + radius * u * z
 
 
-def _is_success(out: dict, f0_val: float) -> bool:
-    """Determine if a single run converged successfully."""
-    if out.get("fail") or out.get("__failed__") or detect_diverged(out, f0_val):
-        return False
+def _run_summary(out: dict, f0_val: float, error: dict | None = None) -> dict:
+    """Retain convergence and failure evidence for one robustness run."""
+    diverged = detect_diverged(out, f0_val)
+    failed = bool(out.get("fail") or out.get("__failed__") or diverged)
     relF = np.asarray(out.get("relF", [np.nan]), dtype=float)
     combo = np.asarray(out.get("combo", [np.nan]), dtype=float)
-    return bool(np.any(relF < _TOL) or np.any(combo < 1e-10))
+    success = bool(not failed and (np.any(relF < _TOL) or np.any(combo < 1e-10)))
+    finite_relF = relF[np.isfinite(relF)]
+    finite_combo = combo[np.isfinite(combo)]
+    failure_reason = out.get("failReason")
+    if diverged and not failure_reason:
+        failure_reason = "detect_diverged"
+    return {
+        "success": success,
+        "failed": failed,
+        "failure_reason": failure_reason,
+        "exception": error,
+        "best_relF": float(np.min(finite_relF)) if finite_relF.size else np.nan,
+        "best_combo": float(np.min(finite_combo)) if finite_combo.size else np.nan,
+        "iterations": int(max(relF.size, combo.size)),
+    }
 
 
 def _build_prm(P: dict, policy: dict, fun_list, d, L_vec,
                x_opt_list, f_opt_list, fname, fparam, W) -> dict:
     """Assemble the algorithm parameter dictionary from policy + global P."""
-    maxIt_obj = policy.get("maxIt", P["maxIt"])
+    maxIt_obj = resolve_iteration_budget(policy, P)
     prm = dict(P)
     prm["maxIt"] = maxIt_obj
     if "tolType" in policy:
@@ -149,13 +170,15 @@ def _worker_mc_part1(args):
 
     results = {}
     for alg_name, alg_func in alg_bank:
+        error = None
         try:
             _, out = alg_func(x0.copy(), dict(prm))
-        except Exception:
-            out = {"fail": True}
-        results[alg_name] = _is_success(out, f0_val)
+        except Exception as exc:
+            out = {"fail": True, "failReason": str(exc)}
+            error = {"type": type(exc).__name__, "message": str(exc)}
+        results[alg_name] = _run_summary(out, f0_val, error)
 
-    return results
+    return mc_idx, results
 
 
 #  Part 1 - Starting-point robustness (parallel)
@@ -169,6 +192,7 @@ def _run_part1(results_dir: str) -> None:
 
     P = {
         "Nagent": 10, "p_edge": 0.5, "maxIt": int(os.environ.get("LOG_SCHEDULE_MAXIT", "500")),
+        "iteration_budget_override": configured_iteration_override(),
         "tol": 1e-12, "tolType": "combo",
         "verbose": False, "NC": 3, "NC_schedule": "log", "log_p": 3.0, "log_c_mix": 2.0, "NC_max": 10, "info": 2,
         "countComm": True, "d_override": 30,
@@ -177,6 +201,7 @@ def _run_part1(results_dir: str) -> None:
     alg_names = [an for an, _ in get_alg_bank("MainComp")]
     scenarios = [("near", _R_NEAR), ("far", _R_FAR)]
     csv_rows = [["Scenario", "Function", "Algorithm", "SuccessRate%"]]
+    raw_runs = []
 
     # Force single-threaded BLAS in spawned workers
     _orig_env = {}
@@ -186,51 +211,61 @@ def _run_part1(results_dir: str) -> None:
         os.environ[k] = "1"
 
     try:
-        with ProcessPoolExecutor(max_workers=_N_WORKERS) as pool:
-            for sc_name, radius in scenarios:
-                print(f"\n{'-'*60}")
-                print(f"  Scenario: {sc_name}  (radius={radius})")
-                print(f"{'-'*60}")
+        for sc_name, radius in scenarios:
+            print(f"\n{'-'*60}")
+            print(f"  Scenario: {sc_name}  (radius={radius})")
+            print(f"{'-'*60}")
 
-                success_data = {}
+            success_data = {}
+            for obj_name in _ALL_FUNCS:
+                t0 = time.perf_counter()
+                print(f"\n  [{sc_name}] {obj_name}  ", end="", flush=True)
+                tasks = [
+                    (obj_name, sample, radius, P)
+                    for sample in range(_NSTART_PART1)
+                ]
+                completed = execute_cached_tasks(
+                    tasks,
+                    _worker_mc_part1,
+                    cache_root=os.path.join(_root, "_run_cache"),
+                    namespace=f"robust_start_{sc_name}_{obj_name}",
+                    max_workers=_N_WORKERS,
+                    progress_every=25,
+                )
+                counts = {algorithm: 0 for algorithm in alg_names}
+                for mc_idx, result in completed:
+                    for algorithm, summary in result.items():
+                        counts[algorithm] += int(summary["success"])
+                    raw_runs.append(
+                        {
+                            "scenario": sc_name,
+                            "radius": radius,
+                            "objective": obj_name,
+                            "mc_index": mc_idx,
+                            "starting_point_seed": 1000 + mc_idx,
+                            "graph_seed": 2000 + mc_idx,
+                            "algorithms": result,
+                        }
+                    )
 
-                for obj_name in _ALL_FUNCS:
-                    t0 = time.perf_counter()
-                    print(f"\n  [{sc_name}] {obj_name}  ", end="", flush=True)
+                elapsed = time.perf_counter() - t0
+                print(f"  ({elapsed:.1f}s)")
+                obj_sr = {}
+                for algorithm in alg_names:
+                    rate = 100.0 * counts[algorithm] / _NSTART_PART1
+                    obj_sr[algorithm] = rate
+                    csv_rows.append([sc_name, obj_name, algorithm, f"{rate:.1f}"])
+                success_data[obj_name] = obj_sr
+                best_algorithm = max(alg_names, key=lambda name: obj_sr[name])
+                print(f"    Best: {best_algorithm} ({obj_sr[best_algorithm]:.0f}%)")
 
-                    tasks = [(obj_name, s, radius, P)
-                             for s in range(_NSTART_PART1)]
-                    futures = [pool.submit(_worker_mc_part1, t) for t in tasks]
-
-                    counts = {an: 0 for an in alg_names}
-                    done = 0
-                    for fut in as_completed(futures):
-                        try:
-                            result = fut.result()
-                            for an, ok in result.items():
-                                if ok:
-                                    counts[an] += 1
-                        except Exception as exc:
-                            print(f"\n    [warn] MC run failed: {exc}")
-                        done += 1
-                        if done % 25 == 0:
-                            print(f"{done}", end=" ", flush=True)
-
-                    elapsed = time.perf_counter() - t0
-                    print(f"  ({elapsed:.1f}s)")
-
-                    obj_sr = {}
-                    for an in alg_names:
-                        sr = 100.0 * counts[an] / _NSTART_PART1
-                        obj_sr[an] = sr
-                        csv_rows.append([sc_name, obj_name, an, f"{sr:.1f}"])
-                    success_data[obj_name] = obj_sr
-
-                    best_an = max(alg_names, key=lambda a: obj_sr[a])
-                    print(f"    Best: {best_an} ({obj_sr[best_an]:.0f}%)")
-
-                fig_success_rate_table(success_data, alg_names, _ALL_FUNCS,
-                                       sc_name, results_dir)
+            fig_success_rate_table(
+                success_data,
+                alg_names,
+                _ALL_FUNCS,
+                sc_name,
+                results_dir,
+            )
 
     finally:
         for k, v in _orig_env.items():
@@ -244,6 +279,19 @@ def _run_part1(results_dir: str) -> None:
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
         csv.writer(fh).writerows(csv_rows)
     print(f"\n[Saved] {csv_path}")
+    write_json_gz(
+        os.path.join(results_dir, "data_log", "raw_starting_point_robustness.json.gz"),
+        {
+            "schema_version": 1,
+            "mode": "robust",
+            "study": "starting_point_robustness",
+            "success_tolerance": _TOL,
+            "runs": sorted(
+                raw_runs,
+                key=lambda row: (row["scenario"], row["objective"], row["mc_index"]),
+            ),
+        },
+    )
 
 
 #  Part 2 - Parameter sensitivity (parallel per-factor)
@@ -317,6 +365,7 @@ def _worker_sweep_factor(args):
 
     relF_all = []
     n_div = 0
+    raw_runs = []
 
     for s in range(_NSTART_SWEEP):
         rng_s = np.random.RandomState(500 + s)
@@ -335,24 +384,42 @@ def _worker_sweep_factor(args):
             prm["M"] = base_M * factor
 
         f0_val = float(np.mean([fi(x0) for fi in fun_list]))
+        diverged = False
+        failure_reason = None
+        error = None
         try:
             _, out = alg_func(x0.copy(), dict(prm))
             relF = np.asarray(out.get("relF", [np.nan]), dtype=float)
             if out.get("fail") or detect_diverged(out, f0_val):
                 n_div += 1
-        except Exception:
+                diverged = True
+                failure_reason = out.get("failReason") or "detect_diverged"
+        except Exception as exc:
             relF = np.array([1.0])
             n_div += 1
+            diverged = True
+            failure_reason = str(exc)
+            error = {"type": type(exc).__name__, "message": str(exc)}
         relF_all.append(relF)
+        raw_runs.append(
+            {
+                "mc_index": s,
+                "seed": 500 + s,
+                "diverged": diverged,
+                "failure_reason": failure_reason,
+                "exception": error,
+                "relF": relF.tolist(),
+            }
+        )
 
     max_len = max(len(r) for r in relF_all)
     padded = np.full((_NSTART_SWEEP, max_len), np.nan)
     for si, r in enumerate(relF_all):
         padded[si, :len(r)] = r
-    relF_mean = np.nanmean(padded, axis=0)
+    relF_mean = nanmean_columns(padded)
 
     is_div = n_div > _NSTART_SWEEP // 2
-    return (factor, relF_mean.tolist(), is_div, alg_idx, pname)
+    return (factor, relF_mean.tolist(), is_div, alg_idx, pname, raw_runs)
 
 
 def _run_part2(results_dir: str) -> None:
@@ -363,6 +430,7 @@ def _run_part2(results_dir: str) -> None:
 
     P = {
         "Nagent": 10, "p_edge": 0.5, "maxIt": int(os.environ.get("LOG_SCHEDULE_MAXIT", "500")),
+        "iteration_budget_override": configured_iteration_override(),
         "tol": 1e-12, "tolType": "combo",
         "verbose": False, "NC": 3, "NC_schedule": "log", "log_p": 3.0, "log_c_mix": 2.0, "NC_max": 10, "info": 2,
         "countComm": True, "d_override": 30,
@@ -374,9 +442,9 @@ def _run_part2(results_dir: str) -> None:
         _orig_env[k] = os.environ.get(k)
         os.environ[k] = "1"
 
+    raw_output = []
     try:
-        with ProcessPoolExecutor(max_workers=_N_WORKERS) as pool:
-            for grp in _SWEEP_GROUPS:
+        for grp in _SWEEP_GROUPS:
                 group_label = grp["label"]
                 alg_mode = grp["alg_mode"]
                 alg_bank_g = get_alg_bank(alg_mode)
@@ -398,18 +466,31 @@ def _run_part2(results_dir: str) -> None:
                                     obj_name, alg_mode, alg_idx,
                                     pname, fac, P))
 
-                    futures = {pool.submit(_worker_sweep_factor, t): t
-                               for t in task_list}
-
                     raw = {}
-                    for fut in as_completed(futures):
-                        try:
-                            fac, relF_list, is_div, ai, pn = fut.result()
-                            raw.setdefault((ai, pn), []).append(
-                                (fac, np.array(relF_list), is_div))
-                        except Exception as exc:
-                            t_info = futures[fut]
-                            print(f"\n    [warn] sweep failed: {exc} ({t_info})")
+                    completed = execute_cached_tasks(
+                        task_list,
+                        _worker_sweep_factor,
+                        cache_root=os.path.join(_root, "_run_cache"),
+                        namespace=f"robust_sweep_{group_label}_{obj_name}",
+                        max_workers=_N_WORKERS,
+                        progress_every=10,
+                    )
+                    for result in completed:
+                        fac, relF_list, is_div, ai, pn, raw_runs = result
+                        raw.setdefault((ai, pn), []).append(
+                            (fac, np.array(relF_list), is_div)
+                        )
+                        raw_output.extend(
+                            {
+                                "group": group_label,
+                                "objective": obj_name,
+                                "algorithm": alg_names_g[ai],
+                                "parameter": pn,
+                                "factor": fac,
+                                **run,
+                            }
+                            for run in raw_runs
+                        )
 
                     entries = []
                     for alg_idx, alg_name in enumerate(alg_names_g):
@@ -455,6 +536,27 @@ def _run_part2(results_dir: str) -> None:
             else:
                 os.environ.pop(k, None)
 
+    write_json_gz(
+        os.path.join(results_dir, "data_log", "raw_parameter_sensitivity.json.gz"),
+        {
+            "schema_version": 1,
+            "mode": "robust",
+            "study": "parameter_sensitivity",
+            "factors": _SWEEP_FACTORS,
+            "runs": sorted(
+                raw_output,
+                key=lambda row: (
+                    row["group"],
+                    row["objective"],
+                    row["algorithm"],
+                    row["parameter"],
+                    row["factor"],
+                    row["mc_index"],
+                ),
+            ),
+        },
+    )
+
 
 #  Entry point
 
@@ -480,5 +582,3 @@ def run_robust(part: str = "all") -> None:
         _run_part2(results_dir)
 
     print("\n[run_robust] All done.")
-
-

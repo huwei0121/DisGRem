@@ -61,5 +61,5 @@ texput.log
 *.toc
 *.vrb
 
-# Scratch/temporary results
-codes/results/scratch/
+# Generated experiment results are frozen in the separate reviewer artifact.
+codes/results/
