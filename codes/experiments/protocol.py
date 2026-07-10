@@ -168,6 +168,11 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _json_round_trip(value: Any) -> Any:
+    """Normalize values exactly as a manifest JSON write/read cycle does."""
+    return json.loads(json.dumps(value, default=_json_default))
+
+
 def stable_payload_sha256(payload: Any) -> str:
     encoded = json.dumps(
         payload,
@@ -513,9 +518,7 @@ def paper_grade_protocol_errors(mode: str, protocol: dict[str, Any]) -> list[str
         errors.append(f"paper-grade vector-mixing cap mismatch: {mode}")
     for key, expected in PAPER_GRADE_PROTOCOL[mode].items():
         actual = protocol.get(key)
-        comparable = json.dumps(actual, sort_keys=True, default=_json_default)
-        expected_json = json.dumps(expected, sort_keys=True, default=_json_default)
-        if comparable != expected_json:
+        if _json_round_trip(actual) != _json_round_trip(expected):
             errors.append(
                 f"paper-grade protocol mismatch: {mode}.{key}="
                 f"{actual!r}, expected {expected!r}"

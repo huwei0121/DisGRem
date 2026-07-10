@@ -88,6 +88,12 @@ def test_policy_budgets_match_frozen_paper_protocol() -> None:
     assert actual == protocol.PAPER_OBJECTIVE_ITERATION_BUDGETS
 
 
+def test_paper_grade_scale_protocol_survives_json_round_trip() -> None:
+    serialized = json.loads(json.dumps(protocol.mode_protocol("scale")))
+
+    assert protocol.paper_grade_protocol_errors("scale", serialized) == []
+
+
 def test_nanmean_columns_preserves_empty_columns_as_nan() -> None:
     values = np.array([[1.0, np.nan], [3.0, np.nan]])
     result = protocol.nanmean_columns(values)
